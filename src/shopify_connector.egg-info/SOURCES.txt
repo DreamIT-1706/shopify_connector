@@ -1,0 +1,10 @@
+setup.py
+src/shopify_connector/__init__.py
+src/shopify_connector/br_ingestion_shopify.py
+src/shopify_connector/br_to_sil_shopify.py
+src/shopify_connector/config_shopify.py
+src/shopify_connector.egg-info/PKG-INFO
+src/shopify_connector.egg-info/SOURCES.txt
+src/shopify_connector.egg-info/dependency_links.txt
+src/shopify_connector.egg-info/requires.txt
+src/shopify_connector.egg-info/top_level.txt
