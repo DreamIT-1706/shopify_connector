@@ -177,16 +177,21 @@ def silver_config(SILVER_LAKEHOUSE_PATH,spark):
         df.write.format("delta").mode("overwrite").save(sil_lakehouse_path)
 
 # In[7]:
-def config_shopify(input_config,spark):
+def config_shopify(input_config, spark):
 
-    input_config_fixed = input_config.replace('\xa0', ' ').strip()
+    if isinstance(input_config, dict):
+        config = input_config
+    elif isinstance(input_config, str):
+        input_config_fixed = input_config.replace('\xa0', ' ').strip()
+        try:
+            config = json.loads(input_config_fixed)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid Shopify config JSON: {e}")
+    else:
+        raise TypeError(f"Unsupported config type: {type(input_config)}")
 
-    try:
-        config = json.loads(input_config_fixed)
-        print("Configuration loaded successfully")
-        print(json.dumps(config, indent=2))         
-    except json.JSONDecodeError as e:
-        print(f"✗ Error: {e}")
+    print("Configuration loaded successfully")
+    print(json.dumps(config, indent=2))
 
     lakehouse_names = ["Bronze_Lakehouse", "Staging_Lakehouse", "Silver_Lakehouse", "Gold_Lakehouse"]
     create_lakehouses(lakehouse_names)
