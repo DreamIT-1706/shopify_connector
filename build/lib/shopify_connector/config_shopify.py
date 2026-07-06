@@ -73,10 +73,20 @@ def _get_db_connection_details():
     return jdbc_url, db_access_token
 
 
-def _load_shopify_rows(source_info_id, spark):
-    source_info_id = str(source_info_id).strip()
-    if not source_info_id:
-        raise ValueError("source_info_id is required")
+def _load_shopify_rows(config_context, spark):
+    if not isinstance(config_context, dict):
+        raise ValueError("config_context must be a dict")
+
+    workspace_id = str(config_context.get("workspace_id", "")).strip()
+    fabric_tenant_id = str(config_context.get("fabric_tenant_id", "")).strip()
+    source_name = str(config_context.get("source_name", "")).strip().lower()
+
+    if not workspace_id:
+        raise ValueError("workspace_id is required")
+    if not fabric_tenant_id:
+        raise ValueError("fabric_tenant_id is required")
+    if source_name != "shopify":
+        raise ValueError(f"Invalid source_name for Shopify config: '{source_name}'")
 
     jdbc_url, db_access_token = _get_db_connection_details()
 
@@ -87,13 +97,16 @@ def _load_shopify_rows(source_info_id, spark):
             "query",
             f"""
             SELECT
-                source_info_id,
                 store_domain,
                 access_token,
                 prefix,
-                active_flag
+                active_flag,
+                workspace_id,
+                fabric_tenant_id,
+                source_entity
             FROM dbo.shopify
-            WHERE source_info_id = '{source_info_id}'
+            WHERE workspace_id = '{workspace_id}'
+              AND fabric_tenant_id = '{fabric_tenant_id}'
             """
         )
         .option("accessToken", db_access_token)
@@ -102,9 +115,23 @@ def _load_shopify_rows(source_info_id, spark):
 
     rows = df.collect()
     if not rows:
-        raise ValueError(f"No Shopify rows found for source_info_id='{source_info_id}'")
+        raise ValueError(
+            f"No Shopify rows found for workspace_id='{workspace_id}', "
+            f"fabric_tenant_id='{fabric_tenant_id}'"
+        )
 
     return rows
+
+
+def _to_bool(value):
+    if value is None:
+        return False
+
+    if isinstance(value, bool):
+        return value
+
+    value_str = str(value).strip().lower()
+    return value_str in ("1", "true", "yes", "y")
 
 
 def _build_shopify_config(rows):
@@ -115,6 +142,7 @@ def _build_shopify_config(rows):
         access_token = row["access_token"]
         prefix = row["prefix"]
         active_flag = row["active_flag"]
+        source_entity = row["source_entity"]
 
         if not store_domain:
             raise ValueError("store_domain is missing in shopify table row")
@@ -122,21 +150,24 @@ def _build_shopify_config(rows):
             raise ValueError(f"access_token is missing for store_domain '{store_domain}'")
         if prefix is None:
             raise ValueError(f"prefix is missing for store_domain '{store_domain}'")
+        if not source_entity:
+            raise ValueError(f"source_entity is missing for store_domain '{store_domain}'")
 
         store_domain = str(store_domain).strip()
+        source_entity = str(source_entity).strip().lower()
+        access_token = str(access_token).strip()
+        prefix = str(prefix).strip()
 
         if store_domain not in config["stores"]:
             config["stores"][store_domain] = {
                 "access_token": access_token,
                 "prefix": prefix,
-                "sources": {
-                    "orders": {"active_flag": bool(active_flag) if active_flag is not None else False}
-                }
+                "sources": {}
             }
-        else:
-            config["stores"][store_domain]["sources"]["orders"]["active_flag"] = (
-                bool(active_flag) if active_flag is not None else False
-            )
+
+        config["stores"][store_domain]["sources"][source_entity] = {
+            "active_flag": _to_bool(active_flag)
+        }
 
     return config
 
@@ -283,8 +314,8 @@ def silver_config(SILVER_LAKEHOUSE_PATH, spark):
         df.write.format("delta").mode("overwrite").save(sil_lakehouse_path)
 
 
-def config_shopify(source_info_id, spark):
-    rows = _load_shopify_rows(source_info_id, spark)
+def config_shopify(config_context, spark):
+    rows = _load_shopify_rows(config_context, spark)
     config = _build_shopify_config(rows)
 
     print("Configuration loaded successfully")
