@@ -18,11 +18,21 @@ def run_pipeline(config, spark):
     print(f"Start Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     try:
-        source_info_id = str(config).strip()
-        if not source_info_id:
-            raise ValueError("run_pipeline expected resolved source_info_id as config input")
+        if not isinstance(config, dict):
+            raise ValueError("run_pipeline expected config context as dict input")
 
-        config_shopify(source_info_id, spark)
+        workspace_id = str(config.get("workspace_id", "")).strip()
+        fabric_tenant_id = str(config.get("fabric_tenant_id", "")).strip()
+        source_name = str(config.get("source_name", "")).strip().lower()
+
+        if not workspace_id:
+            raise ValueError("workspace_id is required in pipeline config")
+        if not fabric_tenant_id:
+            raise ValueError("fabric_tenant_id is required in pipeline config")
+        if source_name != "shopify":
+            raise ValueError(f"Invalid source_name for Shopify pipeline: '{source_name}'")
+
+        config_shopify(config, spark)
         br_ingestion_shopify(spark)
         br_to_sil_shopify(spark)
 
@@ -35,6 +45,7 @@ def run_pipeline(config, spark):
         print(" PIPELINE COMPLETED SUCCESSFULLY")
         print("=" * 60)
         print(f"End Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"Duration: {round(time.time() - start_time, 2)} seconds")
 
         return result
 
@@ -49,5 +60,6 @@ def run_pipeline(config, spark):
         print(" PIPELINE FAILED")
         print("=" * 60)
         print(f"Error: {str(e)}")
+        print(f"Duration: {round(time.time() - start_time, 2)} seconds")
 
         return error_result
