@@ -2,16 +2,16 @@
 # coding: utf-8
 
 import os
+import json
 from datetime import datetime
 from delta.tables import DeltaTable
 from pyspark.sql import *
-from cryptography.fernet import Fernet
 from pyspark.sql.types import *
 from pyspark.sql.functions import *
+from cryptography.fernet import Fernet
+from azure.identity import ClientSecretCredential
 import notebookutils
 from notebookutils import mssparkutils, lakehouse
-from azure.identity import ClientSecretCredential
-from pyspark.sql import SparkSession
 
 from master_connector.configCred import get_credentials
 
@@ -88,10 +88,9 @@ def _load_shopify_rows(source_info_id, spark):
             f"""
             SELECT
                 source_info_id,
-                shopify_store_name,
+                store_domain,
                 access_token,
                 prefix,
-                source,
                 active_flag
             FROM dbo.shopify
             WHERE source_info_id = '{source_info_id}'
@@ -112,34 +111,32 @@ def _build_shopify_config(rows):
     config = {"stores": {}}
 
     for row in rows:
-        store_name = row["shopify_store_name"]
+        store_domain = row["store_domain"]
         access_token = row["access_token"]
         prefix = row["prefix"]
-        source = row["source"]
         active_flag = row["active_flag"]
 
-        if not store_name:
-            raise ValueError("shopify_store_name is missing in shopify table row")
+        if not store_domain:
+            raise ValueError("store_domain is missing in shopify table row")
         if not access_token:
-            raise ValueError(f"access_token is missing for store '{store_name}'")
+            raise ValueError(f"access_token is missing for store_domain '{store_domain}'")
         if prefix is None:
-            raise ValueError(f"prefix is missing for store '{store_name}'")
-        if not source:
-            raise ValueError(f"source is missing for store '{store_name}'")
+            raise ValueError(f"prefix is missing for store_domain '{store_domain}'")
 
-        store_name = str(store_name).strip()
-        source = str(source).strip()
+        store_domain = str(store_domain).strip()
 
-        if store_name not in config["stores"]:
-            config["stores"][store_name] = {
+        if store_domain not in config["stores"]:
+            config["stores"][store_domain] = {
                 "access_token": access_token,
                 "prefix": prefix,
-                "sources": {}
+                "sources": {
+                    "orders": {"active_flag": bool(active_flag) if active_flag is not None else False}
+                }
             }
-
-        config["stores"][store_name]["sources"][source] = {
-            "active_flag": bool(active_flag) if active_flag is not None else False
-        }
+        else:
+            config["stores"][store_domain]["sources"]["orders"]["active_flag"] = (
+                bool(active_flag) if active_flag is not None else False
+            )
 
     return config
 
@@ -183,16 +180,15 @@ def bronze_config(config, fernet, spark, BRONZE_LAKEHOUSE_PATH):
     table_path = f"{BRONZE_LAKEHOUSE_PATH}/Tables/br_shopify_config"
 
     try:
-        target_df = spark.read.format("delta").load(table_path)
+        spark.read.format("delta").load(table_path)
     except Exception:
-        print("Table doesn't exist yet → creating...")
+        print("Table doesn't exist yet -> creating...")
         (
             new_df.write
             .format("delta")
             .mode("overwrite")
             .save(table_path)
         )
-        target_df = spark.read.format("delta").load(table_path)
 
     delta_table = DeltaTable.forPath(spark, table_path)
 
@@ -236,10 +232,10 @@ def staging_config(STAGING_LAKEHOUSE_PATH, BRONZE_LAKEHOUSE_PATH, spark):
 
     try:
         existing_df = spark.read.format("delta").load(PROCESSING_CONFIG_PATH)
-        print("Existing Staging_config found will preserve last_sync and upsert isActive")
+        print("Existing Staging_config found; will preserve last_sync and upsert isActive")
     except Exception:
         existing_df = None
-        print("No existing Staging_config creating from scratch")
+        print("No existing Staging_config; creating from scratch")
 
     if existing_df is not None:
         delta_table = DeltaTable.forPath(spark, PROCESSING_CONFIG_PATH)
@@ -292,7 +288,7 @@ def config_shopify(source_info_id, spark):
     config = _build_shopify_config(rows)
 
     print("Configuration loaded successfully")
-    print(config)
+    print(json.dumps(config, indent=2))
 
     lakehouse_names = ["Bronze_Lakehouse", "Staging_Lakehouse", "Silver_Lakehouse", "Gold_Lakehouse"]
     create_lakehouses(lakehouse_names)
