@@ -2,7 +2,6 @@
 # coding: utf-8
 
 import os
-import json
 from datetime import datetime
 from delta.tables import DeltaTable
 from pyspark.sql import *
@@ -73,7 +72,7 @@ def _get_db_connection_details():
     return jdbc_url, db_access_token
 
 
-def _load_shopify_rows(config_context, spark):
+def _load_shopify_df(config_context, spark):
     if not isinstance(config_context, dict):
         raise ValueError("config_context must be a dict")
 
@@ -113,66 +112,65 @@ def _load_shopify_rows(config_context, spark):
         .load()
     )
 
-    rows = df.collect()
-    if not rows:
+    if df.rdd.isEmpty():
         raise ValueError(
             f"No Shopify rows found for workspace_id='{workspace_id}', "
             f"fabric_tenant_id='{fabric_tenant_id}'"
         )
 
-    return rows
+    return df
 
 
-def _to_bool(value):
-    if value is None:
-        return False
-
-    if isinstance(value, bool):
-        return value
-
-    value_str = str(value).strip().lower()
-    return value_str in ("1", "true", "yes", "y")
+def _to_bool_col(col_name):
+    return when(lower(trim(col(col_name).cast("string"))).isin("1", "true", "yes", "y"), lit(True)).otherwise(lit(False))
 
 
-def _build_shopify_config(rows):
-    config = {"stores": {}}
+def _build_bronze_config_df(shopify_df, fernet, spark):
+    last_sync = datetime.strptime("1900-01-01 00:00:00.00000", "%Y-%m-%d %H:%M:%S.%f")
 
+    required_check = (
+        shopify_df
+        .filter(
+            col("store_domain").isNull() |
+            col("access_token").isNull() |
+            col("prefix").isNull() |
+            col("source_entity").isNull()
+        )
+    )
+
+    if not required_check.rdd.isEmpty():
+        raise ValueError("One or more required Shopify fields are null: store_domain, access_token, prefix, or source_entity")
+
+    rows = shopify_df.select(
+        trim(col("store_domain")).alias("store_domain"),
+        trim(col("access_token")).alias("access_token"),
+        trim(col("prefix").cast("string")).alias("prefix"),
+        lower(trim(col("source_entity"))).alias("source_entity"),
+        _to_bool_col("active_flag").alias("isActive")
+    ).collect()
+
+    bronze_rows = []
     for row in rows:
-        store_domain = row["store_domain"]
+        store_name = row["store_domain"]
         access_token = row["access_token"]
         prefix = row["prefix"]
-        active_flag = row["active_flag"]
-        source_entity = row["source_entity"]
+        source_name = row["source_entity"]
+        is_active = row["isActive"]
 
-        if not store_domain:
-            raise ValueError("store_domain is missing in shopify table row")
-        if not access_token:
-            raise ValueError(f"access_token is missing for store_domain '{store_domain}'")
-        if prefix is None:
-            raise ValueError(f"prefix is missing for store_domain '{store_domain}'")
-        if not source_entity:
-            raise ValueError(f"source_entity is missing for store_domain '{store_domain}'")
+        table_name = f"br_shopify_{source_name}"
+        full_table_name = table_name + prefix
+        encrypted_token = fernet.encrypt(access_token.encode()).decode()
 
-        store_domain = str(store_domain).strip()
-        source_entity = str(source_entity).strip().lower()
-        access_token = str(access_token).strip()
-        prefix = str(prefix).strip()
+        bronze_rows.append((
+            store_name,
+            encrypted_token,
+            full_table_name,
+            source_name,
+            prefix,
+            last_sync,
+            is_active
+        ))
 
-        if store_domain not in config["stores"]:
-            config["stores"][store_domain] = {
-                "access_token": access_token,
-                "prefix": prefix,
-                "sources": {}
-            }
-
-        config["stores"][store_domain]["sources"][source_entity] = {
-            "active_flag": _to_bool(active_flag)
-        }
-
-    return config
-
-
-def bronze_config(config, fernet, spark, BRONZE_LAKEHOUSE_PATH):
     schema = StructType([
         StructField("store", StringType(), True),
         StructField("access_token", StringType(), True),
@@ -183,39 +181,18 @@ def bronze_config(config, fernet, spark, BRONZE_LAKEHOUSE_PATH):
         StructField("isActive", BooleanType(), True)
     ])
 
-    last_sync = datetime.strptime("1900-01-01 00:00:00.00000", "%Y-%m-%d %H:%M:%S.%f")
+    return spark.createDataFrame(bronze_rows, schema)
 
-    data = []
-    for store_name, store_config in config["stores"].items():
-        access_token = store_config["access_token"]
-        prefix = store_config["prefix"]
-        sources = store_config["sources"]
 
-        for source_name, source_config in sources.items():
-            active_flag = source_config["active_flag"]
-            table_name = f"br_shopify_{source_name}"
-            full_table_name = table_name + prefix
-            encrypted_token = fernet.encrypt(access_token.encode()).decode()
-
-            data.append((
-                store_name,
-                encrypted_token,
-                full_table_name,
-                source_name,
-                prefix,
-                last_sync,
-                active_flag
-            ))
-
-    new_df = spark.createDataFrame(data, schema)
+def bronze_config(bronze_df, spark, BRONZE_LAKEHOUSE_PATH):
     table_path = f"{BRONZE_LAKEHOUSE_PATH}/Tables/br_shopify_config"
 
     try:
         spark.read.format("delta").load(table_path)
     except Exception:
-        print("Table doesn't exist yet -> creating...")
+        print("br_shopify_config does not exist yet -> creating...")
         (
-            new_df.write
+            bronze_df.write
             .format("delta")
             .mode("overwrite")
             .save(table_path)
@@ -226,10 +203,13 @@ def bronze_config(config, fernet, spark, BRONZE_LAKEHOUSE_PATH):
     (
         delta_table.alias("target")
         .merge(
-            new_df.alias("source"),
+            bronze_df.alias("source"),
             "target.store = source.store AND target.table = source.table AND target.source = source.source"
         )
         .whenMatchedUpdate(set={
+            "access_token": "source.access_token",
+            "prefix": "source.prefix",
+            "last_sync": "target.last_sync",
             "isActive": "source.isActive"
         })
         .whenNotMatchedInsertAll()
@@ -315,11 +295,7 @@ def silver_config(SILVER_LAKEHOUSE_PATH, spark):
 
 
 def config_shopify(config_context, spark):
-    rows = _load_shopify_rows(config_context, spark)
-    config = _build_shopify_config(rows)
-
-    print("Configuration loaded successfully")
-    print(json.dumps(config, indent=2))
+    shopify_df = _load_shopify_df(config_context, spark)
 
     lakehouse_names = ["Bronze_Lakehouse", "Staging_Lakehouse", "Silver_Lakehouse", "Gold_Lakehouse"]
     create_lakehouses(lakehouse_names)
@@ -347,10 +323,14 @@ def config_shopify(config_context, spark):
         print("New key generated and saved")
 
     fernet = Fernet(private_key)
-    print(f"Fernet key ready: {private_key.decode('utf-8')[:20]}...")
+    bronze_df = _build_bronze_config_df(shopify_df, fernet, spark)
 
-    bronze_config(config, fernet, spark, BRONZE_LAKEHOUSE_PATH)
+    bronze_config(bronze_df, spark, BRONZE_LAKEHOUSE_PATH)
     staging_config(STAGING_LAKEHOUSE_PATH, BRONZE_LAKEHOUSE_PATH, spark)
     silver_config(SILVER_LAKEHOUSE_PATH, spark)
 
-    return config
+    return {
+        "status": "success",
+        "rows_loaded": shopify_df.count(),
+        "bronze_rows_prepared": bronze_df.count()
+    }
